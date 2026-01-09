@@ -516,7 +516,15 @@ def extract_line_items_by_tables(pdf_bytes: bytes, debug: bool = False) -> List[
                 if page_items_found:
                     break
 
-    return items
+    # Filter out false positives (e.g., "14 TH ..." from disclaimer text) by requiring pricing.
+    # Real line items in these quotes always have at least one money field (unit_price/total).
+    cleaned: List[Dict[str, str]] = []
+    for it in items:
+        if not it.get("item_id"):
+            continue
+        if (it.get("unit_price") or "").strip() or (it.get("total") or "").strip():
+            cleaned.append(it)
+    return cleaned
 
 
 # =========================================================
@@ -684,20 +692,24 @@ def extract_line_items_by_words(pdf_bytes: bytes, debug: bool = False) -> List[D
 # HYBRID EXTRACTOR (TABLES FIRST, WORDS FALLBACK)
 # =========================================================
 def extract_line_items_hybrid(pdf_bytes: bytes, debug: bool = False) -> List[Dict[str, str]]:
-    items = extract_line_items_by_tables(pdf_bytes, debug=debug)
-    if not items:
-        items = extract_line_items_by_words(pdf_bytes, debug=debug)
+    # Run both extractors and merge results.
+    # Why: table extraction can be perfect on some PDFs, but can also miss pages or create false positives.
+    # Word extraction is a good backstop. We de-dup + fill missing fields.
+    items_t = extract_line_items_by_tables(pdf_bytes, debug=debug)
+    items_w = extract_line_items_by_words(pdf_bytes, debug=debug)
 
-    # De-dup
-    seen = set()
-    out = []
-    for it in items:
-        k = (it.get("line_no", ""), it.get("item_id", ""), it.get("total", ""))
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(it)
-    return out
+    merged: Dict[tuple, Dict[str, str]] = {}
+    for it in (items_t + items_w):
+        k = (it.get("line_no", "") or "", it.get("item_id", "") or "", it.get("total", "") or "")
+        if k not in merged:
+            merged[k] = dict(it)
+        else:
+            # Fill missing fields from the other method
+            for f in ("qty", "unit_price", "total", "description"):
+                if not (merged[k].get(f) or "").strip() and (it.get(f) or "").strip():
+                    merged[k][f] = it.get(f, "")
+
+    return list(merged.values())
 
 
 # =========================================================
