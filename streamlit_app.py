@@ -52,10 +52,17 @@ TARGET_COLUMNS = [
 # =========================================================
 # REGEX
 # =========================================================
-MONEY_RE = re.compile(r"^\$?[\d,]+\.\d{2,5}$")
-QTY_RE = re.compile(r"^\d+(?:\.\d+)?$")
-ITEM_ID_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-/_]+$")
-ITEM_START_RE = re.compile(r"^(\d{1,4})\s+([A-Z0-9][A-Z0-9.\-/_]+)\b", re.ASCII)
+# Money-like tokens sometimes include a unit suffix in these PDFs, e.g. "1,730.00000MFT" or "0.90000EAC".
+MONEY_RE = re.compile(r"^\$?[\d,]+\.\d{2,5}[A-Za-z]{0,6}$")
+# Quantities can be comma-formatted, e.g. "2,000"
+QTY_RE = re.compile(r"^\d+(?:,\d{3})*(?:\.\d+)?$")
+# Item IDs can include '#', e.g. "W.#2-TINNED/BARE/SOLID"
+ITEM_ID_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-/_#]+$")
+# Avoid \b (word boundary) because '.' and '#' are not word-chars; require whitespace after item token instead.
+ITEM_START_RE = re.compile(r"^(\d{1,4})\s+([A-Z0-9][A-Z0-9.\-/_#]+)(?=\s)", re.ASCII)
+
+# Short all-caps tokens are typically UOM codes (EAC/FT/MFT/EA/PK/etc). Longer all-caps words are often descriptions.
+UOM_RE = re.compile(r"^[A-Z/]{1,4}$")
 
 # Stop only when the line clearly looks like totals header area (start of line), not anywhere in the line.
 SUMMARY_STOP_LINE_RE = re.compile(
@@ -74,6 +81,128 @@ def extract_full_text(pdf_bytes: bytes) -> str:
             txt = page.extract_text() or ""
             full_text += txt + "\n"
     return full_text
+
+
+def extract_quoted_for_from_layout(pdf_bytes: bytes) -> Dict[str, Optional[str]]:
+    """
+    Robustly extract the *Quoted For* (left column) address using word coordinates.
+
+    Why: In these Cadre PDFs, `page.extract_text()` often merges the left and right columns
+    into the same lines (Quoted For + Ship To), which breaks regex-only parsing.
+    """
+    out: Dict[str, Optional[str]] = {
+        "Company": None,
+        "Address": None,
+        "City": None,
+        "State": None,
+        "ZipCode": None,
+        "Country": None,
+    }
+
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            if not pdf.pages:
+                return out
+            page = pdf.pages[0]
+            words = page.extract_words(
+                x_tolerance=2,
+                y_tolerance=2,
+                keep_blank_chars=False,
+                use_text_flow=True,
+            ) or []
+            if not words:
+                return out
+
+            # Find the "Quoted" anchor to limit the vertical region we consider.
+            anchor = next((w for w in words if w.get("text") == "Quoted"), None)
+            if not anchor:
+                return out
+
+            y0 = anchor["top"] - 6
+            y1 = anchor["top"] + 260  # enough to include country line, but not the entire page
+            mid_x = page.width / 2
+
+            left_words = [w for w in words if y0 <= w["top"] <= y1 and w["x0"] < mid_x]
+            if not left_words:
+                return out
+
+            # Group words into visual lines by y buckets
+            buckets: Dict[float, List[dict]] = defaultdict(list)
+            for w in left_words:
+                key = round(w["top"] / 3) * 3
+                buckets[key].append(w)
+
+            lines: List[str] = []
+            for y in sorted(buckets.keys()):
+                row = sorted(buckets[y], key=lambda ww: ww["x0"])
+                line = " ".join(ww["text"] for ww in row).strip()
+                if line:
+                    lines.append(line)
+
+            # Find start line with "Quoted For:" and stop before totals/header sections.
+            start_idx = None
+            for i, ln in enumerate(lines):
+                if ln.lower().startswith("quoted for:"):
+                    start_idx = i
+                    break
+            if start_idx is None:
+                return out
+
+            stop_re = re.compile(r"^(Quote\s+Good\s+Through|Ship\s+Via|Line\s+Item|Product\b|Tax\b|Total\b)", re.IGNORECASE)
+            addr_lines: List[str] = []
+            for ln in lines[start_idx:]:
+                if stop_re.match(ln):
+                    break
+                addr_lines.append(ln)
+
+            if not addr_lines:
+                return out
+
+            # addr_lines[0] is "Quoted For: <Company>"
+            first = addr_lines[0]
+            company = first.split(":", 1)[1].strip() if ":" in first else first.strip()
+            if company:
+                out["Company"] = company
+
+            # Remaining lines should look like:c
+            # street
+            # optional suite
+            # city, ST zip
+            # optional country
+            rest = [ln.strip() for ln in addr_lines[1:] if ln.strip()]
+            city_re = re.compile(r"^([A-Za-z .]+),\s*([A-Z]{2})\s+(\d{5})(?:-\d{4})?$")
+
+            city_idx = None
+            for i, ln in enumerate(rest):
+                if city_re.match(ln):
+                    city_idx = i
+                    break
+
+            if city_idx is not None:
+                m = city_re.match(rest[city_idx])
+                if m:
+                    out["City"] = m.group(1).strip()
+                    out["State"] = m.group(2)
+                    out["ZipCode"] = m.group(3)
+
+                street_parts = rest[:city_idx]
+                if street_parts:
+                    out["Address"] = ", ".join(street_parts)
+
+                if city_idx + 1 < len(rest):
+                    # Whatever is on the next line is treated as country (if it doesn't look like a date/number)
+                    c = rest[city_idx + 1].strip()
+                    if c and not re.match(r"^\d", c):
+                        out["Country"] = c
+            else:
+                # Fallback: if no city line, treat all remaining lines as Address
+                if rest:
+                    out["Address"] = ", ".join(rest)
+
+    except Exception:
+        return out
+
+    return out
 
 
 def normalize_date_str(date_str: Optional[str]) -> Optional[str]:
@@ -112,33 +241,68 @@ def extract_header_info(full_text: str) -> Dict[str, Optional[str]]:
     if m_sales:
         header["ReferralManager"] = m_sales.group(1).strip()
 
-    if "Quoted For:" in full_text and "Quote Good Through" in full_text:
+    # Extract "Quoted For" address using pattern matching (more robust for PDF column layouts)
+    if "Quoted For:" in full_text:
         try:
-            start = full_text.index("Quoted For:")
-            end = full_text.index("Quote Good Through")
-            addr_block = full_text[start:end]
+            start = full_text.index("Quoted For:") + len("Quoted For:")
+            # Find the end - either "Ship To:" or "Quote Good Through"
+            end = len(full_text)
+            if "Ship To:" in full_text:
+                ship_to_pos = full_text.index("Ship To:")
+                if ship_to_pos > start:
+                    end = ship_to_pos
+            if "Quote Good Through" in full_text:
+                qgt_pos = full_text.index("Quote Good Through")
+                if qgt_pos > start:
+                    end = min(end, qgt_pos)
+            quoted_for_block = full_text[start:end].strip()
         except Exception:
-            addr_block = ""
+            quoted_for_block = ""
 
-        m_company = re.search(r"Quoted For:\s*(.+?)\s+Ship To:", addr_block)
-        if m_company:
-            header["Company"] = m_company.group(1).strip()
+        if quoted_for_block:
+            # Strategy: Use regex to find specific patterns rather than relying on line splits
+            # This handles PDFs where columns are merged into one text blob
 
-        m_addr = re.search(r"(\d{3,6}\s+[A-Za-z0-9 .#-]+)", addr_block)
-        if m_addr:
-            header["Address"] = m_addr.group(1).strip()
+            # Company: first "word group" (text before first address-like pattern)
+            # Address pattern: starts with digits (street number)
+            m_company = re.match(r'^([A-Z][A-Za-z0-9 &.\'-]+?)(?=\s+\d{1,6}\s+[A-Z]|\s*$)', quoted_for_block)
+            if m_company:
+                header["Company"] = m_company.group(1).strip()
 
-        m_city = re.search(
-            r"([A-Za-z .]+),\s*([A-Z]{2})\s+(\d{5})(?:-\d{4})?",
-            addr_block,
-        )
-        if m_city:
-            header["City"] = m_city.group(1).strip()
-            header["State"] = m_city.group(2)
-            header["ZipCode"] = m_city.group(3)
+            # Street address: starts with number, capture until city/state/zip pattern
+            # Pattern: "1234 Street Name" possibly with "Suite/Apt/Unit #"
+            m_street = re.search(
+                r'(\d{1,6}\s+[A-Za-z0-9 .#\'-]+?)(?:\s+((?:SUITE|STE|APT|UNIT|BLDG|FLOOR|FL|#)\s*[A-Za-z0-9\-]+))?'
+                r'(?=\s+[A-Za-z .]+,\s*[A-Z]{2}\s+\d{5}|\s*$)',
+                quoted_for_block,
+                re.IGNORECASE
+            )
+            if m_street:
+                addr = m_street.group(1).strip()
+                if m_street.group(2):
+                    addr += ", " + m_street.group(2).strip()
+                header["Address"] = addr
 
-        if "United States of America" in addr_block:
-            header["Country"] = "USA"
+            # City, State, Zip - find FIRST occurrence
+            m_city = re.search(
+                r'([A-Za-z .]+),\s*([A-Z]{2})\s+(\d{5})(?:-\d{4})?',
+                quoted_for_block,
+            )
+            if m_city:
+                header["City"] = m_city.group(1).strip()
+                header["State"] = m_city.group(2)
+                header["ZipCode"] = m_city.group(3)
+
+            # Country: text after city/state/zip that looks like a country name
+            if m_city:
+                after_city = quoted_for_block[m_city.end():].strip()
+                # Take first word group that could be a country (letters/spaces only, not starting with digit)
+                m_country = re.match(r'^([A-Za-z ]+?)(?:\s+[A-Z]{2}\s+\d{5}|\s+\d|\s*$)', after_city)
+                if m_country:
+                    country = m_country.group(1).strip()
+                    # Avoid capturing duplicate city names or other patterns
+                    if country and len(country) > 2 and not re.match(r'^[A-Z]{2}$', country):
+                        header["Country"] = country
 
     m_valid = re.search(r"Quote Good Through\s+(\d{1,2}/\d{1,2}/\d{4})", full_text)
     if m_valid:
@@ -174,7 +338,11 @@ def _safe_float(s: Optional[str]) -> Optional[float]:
     if not s:
         return None
     try:
-        return float(str(s).replace("$", "").replace(",", ""))
+        # Extract leading numeric portion from tokens like "1,730.00000MFT"
+        m = re.search(r"[\d,]+(?:\.\d+)?", str(s))
+        if not m:
+            return None
+        return float(m.group(0).replace("$", "").replace(",", ""))
     except Exception:
         return None
 
@@ -211,7 +379,8 @@ def _parse_item_from_table_row(cells: List[str]) -> Dict[str, str]:
             qty = t
             break
 
-    money = [t for t in tokens if MONEY_RE.match(t)]
+    # Normalize money-like tokens by stripping any unit suffix.
+    money = [re.sub(r"[A-Za-z]+$", "", t) for t in tokens if MONEY_RE.match(t)]
     unit_price = money[-2] if len(money) >= 2 else (money[-1] if len(money) == 1 else "")
     total = money[-1] if len(money) >= 1 else ""
 
@@ -227,7 +396,7 @@ def _parse_item_from_table_row(cells: List[str]) -> Dict[str, str]:
             if not (
                 QTY_RE.match(t)
                 or MONEY_RE.match(t)
-                or re.fullmatch(r"[A-Z/]+", t)
+                or UOM_RE.match(t)
                 or t.isdigit()
             )
         ]
@@ -261,7 +430,7 @@ def _line_is_desc_continuation(line: str) -> bool:
     toks = line.split()
     # If it's mostly numeric/uom, it's not description
     wordy = any(
-        not (QTY_RE.match(t) or MONEY_RE.match(t) or re.fullmatch(r"[A-Z/]+", t) or t.isdigit())
+        not (QTY_RE.match(t) or MONEY_RE.match(t) or UOM_RE.match(t) or t.isdigit())
         for t in toks
     )
     return wordy
@@ -385,10 +554,10 @@ def _parse_item_row_tokens(tokens: List[str]) -> Dict[str, Optional[str]]:
     unit_price = None
     total = None
     if len(money_idxs) >= 2:
-        total = after[money_idxs[-1]]
-        unit_price = after[money_idxs[-2]]
+        total = re.sub(r"[A-Za-z]+$", "", after[money_idxs[-1]])
+        unit_price = re.sub(r"[A-Za-z]+$", "", after[money_idxs[-2]])
     elif len(money_idxs) == 1:
-        total = after[money_idxs[-1]]
+        total = re.sub(r"[A-Za-z]+$", "", after[money_idxs[-1]])
 
     return {
         "line_no": line_no,
@@ -460,7 +629,7 @@ def extract_line_items_by_words(pdf_bytes: bytes, debug: bool = False) -> List[D
                         nxt = visual_lines[i + j].strip()
                         if ITEM_START_RE.match(nxt) or SUMMARY_STOP_LINE_RE.match(nxt):
                             break
-                        nxt_money = [t for t in nxt.split() if MONEY_RE.match(t)]
+                        nxt_money = [re.sub(r"[A-Za-z]+$", "", t) for t in nxt.split() if MONEY_RE.match(t)]
                         if nxt_money:
                             if need_total and current.get("total") is None:
                                 current["total"] = nxt_money[-1]
@@ -478,7 +647,7 @@ def extract_line_items_by_words(pdf_bytes: bytes, debug: bool = False) -> List[D
                 not (
                     QTY_RE.match(t)
                     or MONEY_RE.match(t)
-                    or re.fullmatch(r"[A-Z/]+", t)
+                    or UOM_RE.match(t)
                     or t.isdigit()
                 )
                 for t in toks
@@ -542,26 +711,17 @@ def build_rows_for_pdf(
 ) -> List[Dict]:
     full_text = extract_full_text(pdf_bytes)
     header = extract_header_info(full_text)
+    # Override Quoted For address using layout-based extraction (more reliable for 2-column PDFs)
+    qf = extract_quoted_for_from_layout(pdf_bytes)
+    for k, v in qf.items():
+        if v:  # only overwrite when we successfully extracted something
+            header[k] = v
 
     # HYBRID item extraction (tables first, then words)
     items = extract_line_items_hybrid(pdf_bytes, debug=debug)
 
-    # TAX RULES:
-    # - If tax == 0 or missing: DO NOT include
-    # - If tax > 0: include, but item_desc must be blank
-    tax_val = extract_tax_amount(full_text)
-    if tax_val is not None and abs(tax_val) >= 0.005:
-        tax_str = f"{tax_val:,.2f}"
-        items.append(
-            {
-                "line_no": "TAX",
-                "item_id": "Tax",
-                "qty": "1",
-                "unit_price": tax_str,
-                "total": tax_str,
-                "description": "",  # blank description
-            }
-        )
+    # NOTE: We intentionally do NOT append Tax as a line item.
+    # Some downstream systems want only product line items; tax can be handled separately from totals.
 
     quote_number_text = header.get("QuoteNumber")
     quote_date_text = normalize_date_str(header.get("QuoteDate"))
