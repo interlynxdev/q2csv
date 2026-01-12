@@ -732,8 +732,24 @@ def build_rows_for_pdf(
     # HYBRID item extraction (tables first, then words)
     items = extract_line_items_hybrid(pdf_bytes, debug=debug)
 
-    # NOTE: We intentionally do NOT append Tax as a line item.
-    # Some downstream systems want only product line items; tax can be handled separately from totals.
+    # TAX RULES:
+    # - If tax == 0 or missing: DO NOT include
+    # - If tax > 0: include as a synthetic line item with blank description
+    # - Avoid double-adding if a "Tax" row already exists for any reason
+    tax_val = extract_tax_amount(full_text)
+    already_has_tax = any((it.get("item_id") or "").strip().lower() == "tax" for it in items)
+    if (not already_has_tax) and tax_val is not None and abs(tax_val) >= 0.005:
+        tax_str = f"{tax_val:,.2f}"
+        items.append(
+            {
+                "line_no": "TAX",
+                "item_id": "Tax",
+                "qty": "1",
+                "unit_price": tax_str,
+                "total": tax_str,
+                "description": "",  # blank description
+            }
+        )
 
     quote_number_text = header.get("QuoteNumber")
     quote_date_text = normalize_date_str(header.get("QuoteDate"))
